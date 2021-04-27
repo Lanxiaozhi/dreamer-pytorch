@@ -13,6 +13,8 @@ from memory import ExperienceReplay
 from models import bottle, Encoder, ObservationModel, RewardModel, TransitionModel, ValueModel, ActorModel
 from planner import MPCPlanner
 from utils import lineplot, write_video, imagine_ahead, lambda_return, FreezeParameters, ActivateParameters
+# contrastive loss
+from utils import contrastive
 from tensorboardX import SummaryWriter
 
 
@@ -50,7 +52,7 @@ parser.add_argument('--action-repeat', type=int, default=2,
                     metavar='R', help='Action repeat')
 parser.add_argument('--action-noise', type=float,
                     default=0.3, metavar='ε', help='Action noise')
-parser.add_argument('--episodes', type=int, default=1000,
+parser.add_argument('--episodes', type=int, default=500,
                     metavar='E', help='Total number of episodes')
 parser.add_argument('--seed-episodes', type=int, default=5,
                     metavar='S', help='Seed episodes')
@@ -113,6 +115,9 @@ parser.add_argument('--models', type=str, default='',
 parser.add_argument('--experience-replay', type=str, default='',
                     metavar='ER', help='Load experience replay')
 parser.add_argument('--render', action='store_true', help='Render environment')
+# add contrastive learning
+parser.add_argument('--contrastive', action='store_true', help='Contrastive reward model')
+parser.add_argument('--trade_off', type=float, default=1.0, help='Trade off for contrastive loss')
 args = parser.parse_args()
 # Overshooting distance cannot be greater than chunk size
 args.overshooting_distance = min(args.chunk_size, args.overshooting_distance)
@@ -184,12 +189,16 @@ value_actor_param_list = list(
 params_list = param_list + value_actor_param_list
 model_optimizer = optim.Adam(param_list, lr=0 if args.learning_rate_schedule !=
                              0 else args.model_learning_rate, eps=args.adam_epsilon)
-actor_optimizer = optim.Adam(actor_model.parameters(
-), lr=0 if args.learning_rate_schedule != 0 else args.actor_learning_rate, eps=args.adam_epsilon)
-value_optimizer = optim.Adam(value_model.parameters(
-), lr=0 if args.learning_rate_schedule != 0 else args.value_learning_rate, eps=args.adam_epsilon)
+actor_optimizer = optim.Adam(actor_model.parameters(), 
+                            lr=0 if args.learning_rate_schedule != 0 else args.actor_learning_rate, 
+                            eps=args.adam_epsilon)
+value_optimizer = optim.Adam(value_model.parameters(), 
+                            lr=0 if args.learning_rate_schedule != 0 else args.value_learning_rate, 
+                            eps=args.adam_epsilon)
+
 if args.models != '' and os.path.exists(args.models):
     model_dicts = torch.load(args.models)
+    print("Load pretrained trans/ob/encoder model...")
     transition_model.load_state_dict(model_dicts['transition_model'])
     observation_model.load_state_dict(model_dicts['observation_model'])
     # reward_model.load_state_dict(model_dicts['reward_model'])
@@ -274,8 +283,8 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
         init_belief, init_state = torch.zeros(args.batch_size, args.belief_size, device=args.device), torch.zeros(
             args.batch_size, args.state_size, device=args.device)
         # Update belief/state using posterior from previous belief/state, previous action and current observation (over entire sequence at once)
-        beliefs, prior_states, prior_means, prior_std_devs, posterior_states, posterior_means, posterior_std_devs = transition_model(
-            init_state, actions[:-1], init_belief, bottle(encoder, (observations[1:], )), nonterminals[:-1])
+        beliefs, prior_states, prior_means, prior_std_devs, posterior_states, posterior_means, posterior_std_devs, posterior_states_k = transition_model(
+            init_state, actions[:-1], init_belief, bottle(encoder, (observations[1:], )), nonterminals[:-1], augment=True)
         # Calculate observation likelihood, reward likelihood and KL losses (for t = 0 only for latent overshooting); sum over final dims, average over batch and time (original implementation, though paper seems to miss 1/T scaling?)
         if args.worldmodel_LogProbLoss:
             observation_dist = Normal(
@@ -290,8 +299,18 @@ for episode in tqdm(range(metrics['episodes'][-1] + 1, args.episodes + 1), total
                 bottle(reward_model, (beliefs, posterior_states)), 1)
             reward_loss = -reward_dist.log_prob(rewards[:-1]).mean(dim=(0, 1))
         else:
-            reward_loss = F.mse_loss(bottle(
-                reward_model, (beliefs, posterior_states)), rewards[:-1], reduction='none').mean(dim=(0, 1))
+            if args.contrastive:
+                batch_reward, batch_feature_q = bottle(
+                    reward_model, (beliefs, posterior_states), feature=True)  # [batch_size-1, chunk_size, hidden_size]
+                _, batch_feature_k = bottle(
+                    reward_model, (beliefs, posterior_states_k), feature=True)  # [batch_size-1, chunk_size, hidden_size]
+
+                contrastive_loss = contrastive(batch_feature_q, batch_feature_k, args.device)
+                reward_loss = F.mse_loss(bottle(
+                    reward_model, (beliefs, posterior_states)), rewards[:-1], reduction='none').mean(dim=(0, 1)) + contrastive_loss
+            else:
+                reward_loss = F.mse_loss(bottle(
+                    reward_model, (beliefs, posterior_states)), rewards[:-1], reduction='none').mean(dim=(0, 1))
         # transition loss
         div = kl_divergence(Normal(posterior_means, posterior_std_devs), Normal(
             prior_means, prior_std_devs)).sum(dim=2)

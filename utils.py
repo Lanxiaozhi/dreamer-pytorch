@@ -8,6 +8,7 @@ import torch
 from torch.nn import functional as F
 from typing import Iterable
 from torch.nn import Module
+from torch import nn
 
 
 # Plots min, max and mean + standard deviation bars of a population over time
@@ -176,3 +177,83 @@ class FreezeParameters:
     def __exit__(self, exc_type, exc_val, exc_tb):
         for i, param in enumerate(get_parameters(self.modules)):
             param.requires_grad = self.param_states[i]
+
+
+# class Contrastive(nn.Module):
+#     def __init__(self):
+#         super(Contrastive, self).__init__()
+
+#     @torch.no_grad()
+#     def _dequeue_and_enqueue(self, keys):
+#         # gather keys before updating queue
+#         batch_size = keys.shape[0]
+#         print(batch_size)
+
+#         ptr = int(self.queue_ptr)
+#         if self.K % batch_size != 0:
+#             print(batch_size)
+#         assert self.K % batch_size == 0  # for simplicity
+
+#         # replace the keys at ptr (dequeue and enqueue)
+#         self.queue[:, ptr:ptr + batch_size] = keys.T
+#         ptr = (ptr + batch_size) % self.K  # move pointer
+
+#         self.queue_ptr[0] = ptr
+
+#     def forward(self, im_q, im_k):
+#         """
+#         Input:
+#             im_q: a batch of query images
+#             im_k: a batch of key images
+#         Output:
+#             logits, targets
+#         """
+#         # compute query features
+#         q, features = self.encoder_q(im_q)  # queries: NxC
+#         q = nn.functional.normalize(q, dim=1)
+
+#         # compute key features
+#         with torch.no_grad():  # no gradient to keys
+#             self._momentum_update_key_encoder()  # update the key encoder
+
+#             k, _ = self.encoder_k(im_k)  # keys: NxC
+#             k = nn.functional.normalize(k, dim=1)
+
+#         # compute logits
+#         # Einstein sum is more intuitive
+#         # positive logits: Nx1
+#         l_pos = torch.einsum('nc,nc->n', [q, k]).unsqueeze(-1)
+#         # negative logits: NxK
+#         l_neg = torch.einsum('nc,ck->nk', [q, self.queue.clone().detach()])
+
+#         # logits: Nx(1+K)
+#         logits = torch.cat([l_pos, l_neg], dim=1)
+
+#         # apply temperature
+#         logits /= self.T
+
+#         # labels: positive key indicators
+#         labels = torch.zeros(logits.shape[0], dtype=torch.long).cuda()
+
+#         # dequeue and enqueue
+#         self._dequeue_and_enqueue(k)
+
+#         return logits, labels, features
+
+def contrastive(q, k, device):
+    q = F.normalize(q, dim=1)
+    k = F.normalize(k, dim=1)
+    # compute logits
+    # Einstein sum is more intuitive
+    # positive logits: Nx1
+    # _, z_anch = self.online_net(aug_states_1, log=True)
+    # _, z_target = self.momentum_net(aug_states_2, log=True)
+    W = nn.Parameter(torch.rand(q.shape[1], q.shape[1])).to(device)
+    k_ = torch.matmul(W, k.T)
+    logits = torch.matmul(q, k_)
+    logits = (logits - torch.max(logits, 1)[0][:, None])
+    logits = logits * 0.1 # temperature
+    labels = torch.arange(logits.shape[0]).long().to(device=device)
+    contrastive_loss = (nn.CrossEntropyLoss()(logits, labels))
+
+    return contrastive_loss
